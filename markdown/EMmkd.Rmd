@@ -1,0 +1,1166 @@
+---
+title: "Tutorial Expectation-Maximization for Gaussian Mixture Models"
+output:
+  html_document:
+    df_print: paged
+---
+  
+The goal is to implement the Expectation-Maximization algorithm from scratch for a multivariate Gaussian Mixture Model case. The pgmm package's Wine dataset is used as a test case example.
+
+### Implementation steps
+
+1) **Implementing the basic algorithm with a bivariate example**
+
+- Implement the EM algorithm from scratch for a GMM on the variables 2 and 4 of the Wine dataset.
+- Cluster the data and compare the results with a K-Means algorithm
+- Assess the quality of the clustering (the function classError and/or adjustedRandIndex from the mclust package will be used)
+
+2) **Model selection**
+
+- Find a relevant number of clusters using three criterion methods: AIC, BIC, and (cross-)validated likelihood.
+
+3) **Towards higher dimensional spaces**
+
+- Model more than two variables (from the Wine dataset). Do we find the same clusters, the same number of clusters?
+
+<hr>
+
+# 1 - Prelimiary steps: library and dataset imports
+
+#### 1.1. Library imports
+
+```{r  echo=TRUE, results='hide', message=FALSE}
+
+# install.packages("pgmm")
+# install.packages('mvtnorm')
+# install.packages('mclust')
+# install.packages('ggplot2')
+
+library(pgmm); library(mvtnorm); library(mclust); library(ggplot2)
+
+```
+
+### 1.2. Dataset import
+
+Once the packages are imported, the dataset is loaded into the R environment.
+```{r}
+
+data(wine)
+head(wine)
+
+```
+
+The variables 2 and 4 of the Wine dataset are extracted (of note, they will correspond to our bivariate features).
+The labels of each entry are also extracted.
+
+```{r}
+
+X = as.matrix(wine[,c(2,4)])
+y = wine$Type
+
+```
+
+#### 1.3. Dataset check
+
+We check the shape and content of the features we pre-selected.
+
+```{r}
+
+print(paste("Feature dimensions: ", paste(dim(X), collapse= ", ")))
+print(paste("feature names: ", paste(colnames(X), collapse=", ")))
+
+```
+
+<u>Plot of the bivariate feature data:</u>
+
+```{r}
+
+plot(X, col = y+1, pch=19)
+
+```
+
+#### 1.4. Train/Test Split
+
+As part of our next step, we need to split our dataset between training and testing sets. To this effect, we choose a $\frac{2}{3}$ split for training and $\frac{1}{3}$ split for testing. The split is done at random via a randomized sample of the feature array's indexes.
+
+```{r}
+
+n = dim(X)[1]
+
+training_split = round(2/3*n,0)
+
+randomized_indexes = sample(1:nrow(X))
+randomized_X = X[randomized_indexes,]
+randomized_y = y[randomized_indexes]
+
+X_train = randomized_X[1:training_split,]
+X_test = randomized_X[training_split:n,]
+y_train = randomized_y[1:training_split]
+y_test = randomized_y[training_split:n]
+
+```
+
+
+# 2 - Function declarations
+
+In this section we declare our multivariate EM algorithm along with a K-Means algorithm and other sets of functions to help in the process.
+
+#### 2.1. Generic functions
+
+Functions are declared in alphabetical order.
+
+```{r}
+
+euclidianDistance <- function(x, centroid){
+  ######
+  #### Computes the euclidian distance between a datapoint and a centroid.
+  ######
+  
+  # Declares necessary functions for computing the euclidian distance
+  dist = function(a, b) (a-b)^2
+  norm = function(a)    sqrt(sum(mapply(dist, a, centroid)))
+  
+  # Computes the distances
+  distances = t(apply(x, 1, norm))
+  
+  # Return statement
+  return(distances)
+}
+
+findClosestCentroids <- function(x, centroids, clusters){
+  ######
+  #### Computes the centroid closest to each datapoints in an input array.
+  ######
+  
+  # Variable initialization
+  n = dim(x)[1]
+  distances = c()
+  
+  # Computes the euclidian distances
+  for (cl in 1:clusters){
+    cluster_dist = euclidianDistance(x, centroids[cl,])
+    distances = append(distances, cluster_dist)
+  }
+  distances = array(distances, dim=c(n, clusters))
+  
+  # Finds the closest centroids
+  closest = (distances == apply(distances, 1, min))
+  
+  # Return statement
+  return(list("distances"=distances, "closest"=closest))
+    
+}
+
+findClusters <- function(likelihoods) {
+  ######
+  #### Given an array of likelihood values (each column representing the 
+  #### likelihood of belonging to a specific cluster, each row representing 
+  #### a datapoint in an underlying dataset), finds the most matching cluster.
+  ######
+  
+  # Finds the most likely distribution to which each point belongs
+  clustering = apply((likelihoods == apply(likelihoods, 1, max)), 1, which)
+  
+  # Return statement
+  return(clustering)
+}
+
+generateCentroid <- function(x) {
+  ######
+  #### Generates a random centroid for a given dataset, given a normal
+  #### multivariate distribution with the mean and variance equal to the
+  #### empirical mu and Sigma of the dataset.
+  ######
+  
+  # Variable initialization
+  centroid = c()
+  
+  # Randomly draws a value for each dimension of the dataset
+  centroid = rmvnorm(1, colMeans(x), cov(x))
+  colnames(centroid) <- NULL
+  
+  # return statement
+  return(centroid)
+}
+
+logSumExp <- function (x) {
+  ######
+  #### Computes the log-sum-exponential of a vector/list of variables.
+  ######
+  
+  max(x) + log(sum(exp(x - max(x))))
+}
+
+logLikelihood <- function(n, clusters, x, prop, mu, sigma) {
+  ######
+  #### Computes the gamma values of a dataset as part of an EM algorithm.
+  ######
+  
+  # Variable initialization
+  lgn = matrix(nrow=n, ncol=clusters)
+  
+  # Computes the gammas per clusters
+  for (cl in 1:clusters){
+    log_proba = matrix(dmvnorm(x, mu[cl,], sigma[[cl]], log=TRUE))
+    lgn[,cl] = log(prop[cl]) + log_proba
+  }
+  
+  # return statement
+  return(lgn)
+}
+
+mostMatchingDistribution <- function(clusters, x, prop, mu, sigma){
+  ######
+  #### Given a set of points, find the most matching distributions for them.
+  #### To be used for a test set.
+  ######
+  
+  # Computes the likelihood of belonging to a distribution
+  likelihoods = logLikelihood(dim(x)[1], clusters, x, prop, mu, sigma)
+  clustering = findClusters(likelihoods)
+  
+  # return statement
+  return(list("likelihoods" = likelihoods, "clustering" = clustering))
+}
+
+```
+
+
+#### 2.2. K-Means Algorithm
+
+We implement the K-Means algorithm from scratch.
+
+```{r}
+
+kMeans <- function(x, clusters, maxIterations=200, printMessage=T) {
+  ######
+  #### Implementation of a K-Means algorithm.
+  ######
+  
+  if(printMessage){cat("Processing KM-Means with", clusters, "cluster(s).")}
+  
+  # Variable initialization: dimensions of the input data
+  n = dim(x)[1]
+  K = dim(x)[2]
+  # Variable initialization: centroids
+  centroids = t(lapply(1:clusters, function(i) generateCentroid(x)))
+  centroids = matrix(unlist(centroids), ncol=K, byrow=TRUE)
+  # Variables initialization: vector to record step values
+  history_centroids = c(centroids)
+  
+  ###########################
+  ###### KM loop BEGIN ###### 
+  ###########################
+  for (loop in 1:maxIterations){
+    
+    # Computes the current closest centroids for each datapoint
+    closest_centroids = findClosestCentroids(x, centroids, clusters)
+   
+    # Updates the closest centroids
+    centroids = c()
+    for (cl in 1:clusters) {
+      centroids = rbind(centroids, colMeans(x[closest_centroids$closest[,cl],]))
+    }
+    
+    # Erases the matrix's columns and rows names inherited from the dataset
+    colnames(centroids) <- NULL
+    rownames(centroids) <- NULL
+    
+    # Records the loop's update
+    history_centroids = append(history_centroids, centroids)
+  }
+  ###########################
+  ####### KM loop END ####### 
+  ###########################
+  
+  #return statement
+  ret = list(
+    "centroids" = centroids,
+    "distances" = closest_centroids$distances,
+    "closest_centroids" = apply(closest_centroids$closest, 1, which),
+    "centroids_history" = history_centroids
+   )
+  return(ret)
+}
+
+```
+
+
+#### 2.3. Expectation-Maximization algorithm 
+
+We implement the EM algorithm for multivariate data from scratch.
+
+```{r}
+
+expectationMaximization <- function(
+  x, clusters, 
+  maxIterations=200, kmInit = F,
+  printMessage=T
+) {
+  ######
+  #### Implementation of a multivariate EM algorithm.
+  ######
+  
+  if (printMessage) {
+    if (kmInit) {
+      cat("Processing EM with", clusters, "cluster(s), KM initialization.")
+    } else {
+      cat("Processing EM with", clusters, "cluster(s), random initialization.")
+    }
+  }
+  
+  # Variables initialization: dimensions of the input dataset
+  n = dim(x)[1]
+  K = dim(x)[2]
+  # Variables initialization: starting values for the EM parameters (means
+  # and sigmas are generated randomly with a multivariate normal distribution)
+  prop = rep(1/clusters, clusters)
+  if (kmInit) {
+    mu = kMeans(x, clusters, maxIterations, printMessage=F)$centroids
+  } else {
+    mu = rmvnorm(clusters, colMeans(x), cov(x))
+  }
+  sigma = lapply(1:clusters, function(i) cov(x))
+  # Variables initialization: comparators, vectors for recording 
+  #                           step values, etc.
+  history_LLH = c()
+  history_prop = c()
+  history_mu = c()
+  history_sigma = c()
+  previous_LLH = -Inf
+  counter = 0
+  loop_counter = 0
+  
+  ###########################
+  ###### EM loop BEGIN ###### 
+  ###########################
+  for (loop in 1:maxIterations){
+    
+    ################################################
+    #### E(xpectation)-Step (with logExp trick) ####
+    ################################################
+    
+    loop_counter = loop_counter + 1
+    
+    # Computes log-likelihood of the setup at the start of the loop
+    LLH = logLikelihood(n, clusters, x, prop, mu, sigma)
+    sum_LLH = sum(apply(LLH, 1, logSumExp))
+    
+    # Checks the LLH with the last recorded LLH for early stopping
+    # Criterion: no update for 5 loops (with llh rounded to 4 decimals)
+    if (round(sum_LLH,4) <= round(previous_LLH,4)) {
+      counter = counter + 1
+      if (counter >= 5) {
+        if (printMessage) {cat("\nEarly stopping at loop:", loop)}
+        break
+      }
+    } else {counter = 0; previous_LLH = sum_LLH}
+    
+    # Records the current LLH (plotting purposes)
+    history_LLH = append(history_LLH, sum_LLH)
+    
+    # Computes the gamma values per datapoints and clusters with
+    # the logExp trick
+    gam = exp(LLH - apply(LLH, 1, logSumExp))
+    
+    ################################################
+    ############## M(aximization)-Step #############
+    ################################################
+    
+    # Computes the update parameters of the EM algorithm 
+    # for the current loop for each cluster
+    for (cl in 1:clusters) {
+      
+      # Computes the sum of gammas and updates the cluster's proportions
+      nk = sum(gam[,cl])
+      prop[cl] = nk/n
+      # Updates the mean parameters
+      mean_compute = function(i) gam[i,cl] * x[i,]
+      mu[cl,] = Reduce("+", lapply(1:n, mean_compute))/nk
+      # Updates the covariance matrix parameters
+      m = mu[cl,]
+      sigma_compute = function(i) gam[i,cl] * (x[i,]-m) %*% t(x[i,]-m)
+      sigma[[cl]] = Reduce("+", lapply(1:n, sigma_compute))/nk
+      
+    }
+    
+    # Records the loop's updates
+    history_prop = append(history_prop, prop)
+    history_mu = append(history_mu, mu)
+    history_sigma = append(history_sigma, sigma)
+    
+  }
+  ###########################
+  ####### EM loop END ####### 
+  ###########################
+  
+  # Computes the log-likelihood results for the given dataset
+  llh_results = mostMatchingDistribution(clusters, x, prop, mu, sigma)
+  llh_sum = sum(apply(llh_results$likelihoods, 1, logSumExp))
+  if (printMessage) {cat("\nEnd log-likelihood: ", llh_sum, "\n")}
+  
+  # Formatting the record variables
+  history_prop = array(history_prop, c(loop_counter, clusters))
+  history_mu = array(history_mu, c(clusters, K, loop_counter))
+  history_sigma = array(history_sigma, c(clusters, K, K, loop_counter))
+  
+  # return statement
+  ret = list(
+    "N" = n,
+    "n_clusters" = clusters,
+    "prop" = prop,
+    "means" = mu,
+    "sigma" = sigma,
+    "clustering" = llh_results$clustering,
+    "llh_per_points" = llh_results$likelihoods,
+    "llh_sum" = llh_sum,
+    "prop_history" = history_prop,
+    "means_history" = history_mu,
+    "sigma_history" = history_sigma,
+    "llh_history" = history_LLH
+    )
+  return(ret)
+}
+
+```
+
+
+#### 2.4. Akaike Information Criterion
+
+```{r}
+
+akaikeIC <- function(llh, clusters, K) {
+  ######
+  #### Implementation of the the Akaike Information Criterion such that:
+  #### AIC = log-likelihood - eta(M)
+  #### i.e. the final log-likelihood of a model minus the number of free
+  #### scalar parameters in the model (nb of proportions (-1 as there are
+  #### only cluster-1 degrees of freedom) + nb of means + nb of sigmas).
+  ######
+  llh - (clusters-1) + clusters*K + clusters*((K*(K+1))/2)
+}
+
+computeAIC <- function(x, max_cluster=max_clusters, print_steps=TRUE){
+  ######
+  #### Computes the AIC of an EM algorithm implementation.
+  ######
+  
+  # Variable initialization
+  akaike_results = c()
+  
+  # Loops through a cluster parameter range to compute the AIC
+  for (cl in min_clusters:max_cluster){
+    EM = expectationMaximization(x, clusters=cl, printMessage=F)
+    akaike = akaikeIC(EM$llh_sum, cl, dim(x)[2])
+    akaike_results = append(akaike_results, akaike)
+    if (print_steps) {
+      print(paste("Total LLH with ", cl, " clusters: ", round(akaike, 3)))
+    }
+  }
+  
+  # Prints the result
+  print(paste("The best AIC result is achieved with ", 
+              which.max(akaike_results)+2, 
+              " clusters."))
+}
+
+```
+
+
+#### 2.5. Bayesian Information Criterion
+
+```{r}
+
+bayesianIC <- function(llh, clusters, n, K) {
+  ######
+  #### Implementation of the Bayesian Information Criterion such that:
+  #### BIC = LLH - 1/2*eta(M)*log(n)
+  #### i.e. the final log-likelihood of a model minus the half of the number
+  #### of free scalar parameters in the model (nb of proportions (-1 as there
+  #### are only cluster-1 degrees of freedom) + nb of means + nb of sigmas)
+  #### then multiplied by the log of the number of datapoints.
+  ######
+  
+  # Variable declaration
+  llh - 1/2 * ((clusters-1) + clusters*K + clusters*((K*(K+1))/2)) * log(n)
+}
+
+computeBIC <- function(x, max_cluster=max_clusters, print_steps=TRUE){
+  ######
+  #### Computes the BIC of an EM algorithm implementation.
+  ######
+  
+  # Variable declaration
+  bayesian_results = c()
+  
+  # Loops through each cluster parameter to compute the corresponding AIC
+  for (cl in min_clusters:max_cluster){
+    EM = expectationMaximization(x, clusters=cl, printMessage=F)
+    bayesian = bayesianIC(EM$llh_sum, cl, dim(x)[1], dim(x)[2])
+    bayesian_results = append(bayesian_results, bayesian)
+    if (print_steps) {
+      print(paste("Total LLH with ", cl, " clusters: ", round(bayesian, 3)))
+    }
+  }
+
+  # Prints the result
+  print(paste("The best BIC result is achieved with ", 
+              which.max(bayesian_results)+2, 
+              " clusters."))
+}
+
+```
+
+
+#### 2.6. (Cross-)Validated Likelihood
+
+```{r}
+
+doubleCrossValidation <- function(x_train, x_test, folds=10, max_cl=max_clusters) {
+  ######
+  #### Implements a double cross-validation with the resulting log-likelihood
+  #### being the selection criteria.
+  ######
+  
+  # Variable initialization
+  n_train = dim(x_train)[1]
+  foldAllocation = ceiling(seq_along(c(1:n_train))/(n_train/10))
+  fold_indexes = split(c(1:n_train), foldAllocation)
+  mean_cluster_criteria = c()
+  
+  # Iterates over the cluster range
+  for (cl in min_clusters:max_cl){
+    
+    # Performs the first step of the double cross-validation: iteration
+    # over the folds of the training set
+    llhs = c()
+    best_model = NULL
+    
+    # iterates over the k-folds
+    for (kFold in fold_indexes){
+      
+      # Stores the training dataset depending on which fold is validation
+      x_train_train = x_train[-kFold,]
+      x_train_val = x_train[kFold,]
+      
+      # Computes the EM (on the training set)
+      EM = expectationMaximization(x_train_train, cl, printMessage=F)
+      
+      # Retrieves the resulting llhs/distributions on the validation set
+      dists = mostMatchingDistribution(
+        EM$n_clusters, x_train_val, EM$prop, EM$means, EM$sigma
+      )
+      
+      # Records the resulting log-likelihood
+      sum_of_llhs = sum(apply(dists$likelihoods, 1, logSumExp))
+      llhs = append(llhs, sum_of_llhs)
+      
+      # Updates the best models computed so far if needed
+      if (is.null(best_model) || sum_of_llhs == min(llhs)){
+        best_model <- EM
+      }
+    }
+    
+    # Computes the likelihood on the test set given the model
+    # with the highest performance on the validation set
+    dists = mostMatchingDistribution(
+        best_model$n_clusters, 
+        x_test,
+        best_model$prop, 
+        best_model$means, 
+        best_model$sigma
+        )
+    
+    # Records the resulting log-likelihood
+    llhs = append(llhs, sum(apply(dists$likelihoods, 1, logSumExp)))
+    
+    # Records the mean llhs achieved with the cluster parameter
+    print(paste("Mean log-likelihood achieved with ", cl, " clusters: ",
+                round(mean(llhs), 4)))
+    mean_cluster_criteria = append(mean_cluster_criteria, mean(llhs))
+  }
+  
+  # Finds which cluster had the best performance
+  best_cluster = which.max(mean_cluster_criteria)
+  print(paste("The best result is achieved with ", 
+            best_cluster+2, 
+            " clusters (double CV)."))
+  
+  # return statement
+  return(mean_cluster_criteria)
+  
+}
+
+```
+
+#### 2.7. ggplot2 plotting
+
+```{r}
+
+plotData <- function(
+  x, clustering, mean_clusters,
+  t="K-Means", xl="Alcohol", yl="Fixed Acidity"
+) {
+  ######
+  #### Plots a cloud of point with clustering ellipses.
+  #####
+  
+  # Formats the input data as a dataframe
+  df = data.frame(x)
+  mean_clusters = data.frame(mean_clusters)
+  names(mean_clusters) = names(df)
+  
+  # Formats the clustering labels as factors for coloring
+  colors = as.factor(clustering)
+  
+  # Declares the plot
+  p = ggplot(df, aes_string(names(df)[1], names(df)[2], color=colors)) + 
+    geom_point() +
+    stat_ellipse(geom="polygon", aes(fill=colors), alpha=0.05) + 
+    guides(fill = "none") + 
+    labs(color="Wine Type", 
+         title=paste("Clustering obtained via", t), 
+         x=xl,y=yl) + 
+    geom_point(data=mean_clusters, color="black")
+  
+  # return statement 
+  return(p)
+}
+
+```
+
+
+# 3 - Comparing EM and K-Means
+
+#### 3.1.1. Computing and plotting the results (Full Dataset)
+
+We compute our results with the EM (with and without the K-Means initialization) and K-Means algorithms on the full dataset.
+
+```{r}
+
+n_clusters = 3
+min_clusters = length(unique(y))
+max_clusters = 10
+
+resultsEMwithoutKM = expectationMaximization(X, n_clusters)
+
+```
+
+```{r}
+
+resultsEMwithKM = expectationMaximization(X, n_clusters, kmInit=T)
+
+```
+
+```{r}
+
+resultsKM = kMeans(X, n_clusters)
+
+```
+
+
+We start with displaying the results of the clustering via a simple K-Means:
+
+```{r}
+
+# non-ggplot implementation without ellipses
+# plot(X, col=resultsKM$closest_centroids + 1, pch=19)
+# points(resultsKM$centroids, col=1, pch=10)
+# title(main="Clustering obtained via K-Means")
+
+plotData(X, resultsKM$closest_centroids, resultsKM$centroids)
+
+```
+
+We display the final clustering for the EM algorithm (with and without KMeans):
+
+```{r}
+
+# non-ggplot implementation without ellipses
+# plot(X, col=resultsEMwithoutKM$clustering+1, pch=19)
+# points(resultsEMwithoutKM$means, col=1, pch=10)
+# title(main="Clustering obtained via EM (without K-Means init.)")
+
+plotData(X, resultsEMwithoutKM$clustering, resultsEMwithoutKM$means,
+         t="EM (without K-Means init.)")
+
+```
+
+```{r}
+
+# non-ggplot implementation without ellipses
+# plot(X, col=resultsEMwithKM$clustering+1, pch=19)
+# points(resultsEMwithKM$means, col=1, pch=10)
+# title(main="Clustering obtained via EM (with K-Means init.)")
+
+plotData(X, resultsEMwithKM$clustering, resultsEMwithKM$means, 
+         t="EM (with K-Means init.)")
+
+```
+
+
+#### 3.1.2. Computing and plotting the results (Train-Test Split)
+
+We compute our results with the EM and K-Means algorithms on the training set.
+
+```{r}
+
+resultsEM_train_withoutKM = expectationMaximization(X_train, n_clusters)
+
+```
+
+```{r}
+
+resultsEM_train_withKM = expectationMaximization(X_train, n_clusters, kmInit=T)
+
+```
+
+```{r}
+
+resultsKM_train = kMeans(X_train, n_clusters)
+
+```
+
+Then we test our clustering results on the test dataset.
+
+```{r}
+
+test_resultsEM_withoutKM = mostMatchingDistribution(
+  n_clusters, 
+  X_test, 
+  resultsEM_train_withoutKM$prop, 
+  resultsEM_train_withoutKM$means, 
+  resultsEM_train_withoutKM$sigma
+  )
+
+test_resultsEM_withKM = mostMatchingDistribution(
+  n_clusters, 
+  X_test, 
+  resultsEM_train_withKM$prop, 
+  resultsEM_train_withKM$means, 
+  resultsEM_train_withKM$sigma
+  )
+
+test_resultsKM = findClosestCentroids(
+  X_test, 
+  resultsKM_train$centroids,
+  n_clusters
+  )
+test_resultsKM$closest = apply(test_resultsKM$closest, 1, which)
+
+```
+
+We display the final clustering for the EM algorithm (with and without KMeans):
+
+```{r}
+
+# non-ggplot implementation without ellipses
+# plot(X_test, col=test_resultsEM_withoutKM$clustering+1, pch=19)
+# points(resultsEM_train_withoutKM$means, col=1, pch=10)
+# title(main="Test set clustering obtained via EM (without K-Means init.)")
+
+plotData(X_test, test_resultsEM_withoutKM$clustering, 
+         resultsEM_train_withoutKM$means, 
+         t="EM, test set, (without K-Means init.)")
+
+```
+
+```{r}
+
+# non-ggplot implementation without ellipses
+# plot(X_test, col=test_resultsEM_withKM$clustering+1, pch=19)
+# points(resultsEM_train_withKM$means, col=1, pch=10)
+# title(main="Test set clustering obtained via EM (with K-Means init.)")
+
+plotData(X_test, test_resultsEM_withKM$clustering, 
+         resultsEM_train_withKM$means, 
+         t="EM, test set, (with K-Means init.)")
+
+```
+
+
+We display the final clustering for the K-Means algorithm:
+
+```{r}
+
+# non-ggplot implementation without ellipses
+# plot(X_test, col=test_resultsKM$closest+1, pch=19)
+# points(resultsKM_train$centroids, col=1, pch=10)
+
+plotData(X_test, test_resultsKM$closest, resultsKM_train$centroids, 
+         t="K-Means, test set")
+
+```
+
+Relying on the **mclust** library, we compute the classError and adjustedRandIndex to assess the quality of our clustering.
+
+#### 3.2.1 Classification Error when clustering the whole dataset
+
+Relying on the **mclust** library, we compute the [classError](https://mclust-org.github.io/mclust/reference/classError.html) to assess the quality of our clustering. The **Classification Error** corresponds to the rate of a given classification relative to the known classes, and the location of misclassified data points. I.e. Lower the better.
+
+<u>Expectation-Maximization:</u>
+
+For the case with a random initialization:
+
+```{r}
+
+classError(resultsEMwithoutKM$clustering, y)
+
+```
+
+For the case with a k-means initialization:
+
+```{r}
+
+classError(resultsEMwithKM$clustering, y)
+
+```
+
+<u>K-Means:</u>
+
+```{r}
+
+classError(resultsKM$closest_centroid, y)
+
+```
+
+
+#### 3.2.2 Classification Error when clustering the test set (after training)
+
+<u>Expectation-Maximization:</u>
+
+For the case with a random initialization:
+
+```{r}
+
+classError(test_resultsEM_withoutKM$clustering, y_test)
+
+```
+
+For the case with a k-means initialization:
+
+```{r}
+
+classError(test_resultsEM_withKM$clustering, y_test)
+
+```
+
+<u>K-Means:</u>
+
+```{r}
+
+classError(test_resultsKM$closest, y_test)
+
+```
+
+
+#### 3.3.1. Adjusted Rand Index when clustering the whole dataset
+
+Relying on the **mclust** library, we compute the [Adjusted Rand Index](https://mclust-org.github.io/mclust/reference/adjustedRandIndex.html) to assess the quality of our clustering. The **Adjusted Rand Index** compares two partitions of values with a resulting score between 0 and 1, with zero indicating randomness between the two and 1 indicating a perfect match. I.e. Higher the better.
+
+<u>Expectation-Maximization:</u>
+
+For the case with a random initialization:
+
+```{r}
+
+adjustedRandIndex(resultsEMwithoutKM$clustering, y)
+
+```
+
+For the case with a k-means initialization:
+
+```{r}
+
+adjustedRandIndex(resultsEMwithKM$clustering, y)
+
+```
+
+<u>K-Means:</u>
+
+```{r}
+
+adjustedRandIndex(resultsKM$closest_centroid, y)
+
+```
+
+
+#### 3.3.2. Adjusted Rand Index when clustering the test set (after training)
+
+<u>Expectation-Maximization:</u>
+
+For the case with a random initialization:
+
+```{r}
+
+adjustedRandIndex(test_resultsEM_withoutKM$clustering, y_test)
+
+```
+
+For the case with a k-means initialization:
+
+```{r}
+
+adjustedRandIndex(test_resultsEM_withKM$clustering, y_test)
+
+```
+
+<u>K-Means:</u>
+
+```{r}
+
+adjustedRandIndex(test_resultsKM$closest, y_test)
+
+```
+
+#### 3.4. Comments and observations
+
+In general, we observe that the EM algorithm performs better than the K-Means algorithm. Furthermore we observe that in general, a random initialization performs bettern than a k-means initialization for the EM algorithm. As the K-Means provides somewhat already optimized centroids, the algorithm does not seem to update as efficiently as the random initialization on the two selected features, given the same number of iterations. However, we still observe that the EM algorithm improves on the performance of the K-Means alone.
+
+These observations are highlighted by our metrics (class error and adjusted rand error) where the EM algorithm obtains better results (lower class error and higher adjusted rand index) compared to the KM.
+
+<u>Example of metrics obtained on October 29th:</u>
+
+| algorithm | class error | adjusted rand index |
+| --- | --- | --- |
+| EM (full dataset, random init.) | 0.29 | 0.33 |
+| EM (full dataset, KM init.) | 0.48 | 0.16 |
+| EM (test dataset, random init.) | **0.25** | **0.37** |
+| EM (test dataset, KM init.) | 0.46 | 0.18 |
+| KM (full dataset) | 0.49 | 0.15 |
+| KM (test dataset) | 0.48 | 0.18 |
+
+Another minor observation is that, rarely, the K-Means ends up splitting the data points vertically rather than horizontally.
+
+# 4 - Performing Model Selection with the EM algorithm
+
+Starting with a cluster number of 3 (we know as the number of types of wine in the dataset), we increase the cluster parameter and check with different heuristics and criteria to select the best EM model.
+
+Given our previous result, we use the case with a random initialization to compute our criteria.
+
+#### 4.1. Using the Akaike Information Criterion
+
+```{r}
+
+computeAIC(X)
+
+```
+
+#### 4.2. Using the Bayesian Information Criterion
+
+```{r}
+
+computeBIC(X)
+
+```
+
+#### 4.3. Using Cross-Validated Likelihood
+
+We implement a double cross-validation with 10 folds and a maximum cluster parameter of 10.
+
+
+```{r}
+
+cv_logLikelihoods = doubleCrossValidation(X_train, X_test) 
+
+```
+
+
+#### 4.4. Comments and observations
+
+We find that the Akaike Information Criterion is unstable compared to the Bayesian Information Criterion and the Cross-Validated Likelihood. While the latter two consistently yield 2 as the best number of clusters, the AIC tends to favor a higher, and inconsistent, number of cluster. During our experiment, the AIC produced 9 as the best cluster number for instance.
+
+# 5 - Testing with higher-dimensional spaces
+
+#### 5.1. Hand-selected features
+
+We decide to select the first 3 features in this first hand-selected testing of the EM algorithm with a high-dimensional dataset.
+
+```{r}
+
+Xhd = as.matrix(wine[,c(2:4)])
+
+```
+
+We compute the best cluster number for the dataset using the BIC.
+
+```{r}
+
+computeBIC(Xhd)
+
+```
+
+We find that the best results are obtained using 3 clusters with the high-dimensional dataset. Based on this, we try to apply the EM algorithm on a train split of the dataset and try to check the resulting clustering on a test dataset.
+
+```{r}
+
+# we reuse the randomized indexes computed in 1.4
+randomized_Xhd = Xhd[randomized_indexes,]
+randomized_yhd = y[randomized_indexes]
+Xhd_train = randomized_Xhd[1:training_split,]
+Xhd_test = randomized_Xhd[training_split:n,]
+yhd_train = randomized_yhd[1:training_split]
+yhd_test = randomized_yhd[training_split:n]
+
+resultsEMhd_train = expectationMaximization(Xhd_train, 3)
+
+test_resultsEMhd = mostMatchingDistribution(
+  3, 
+  Xhd_test, 
+  resultsEMhd_train$prop, 
+  resultsEMhd_train$means, 
+  resultsEMhd_train$sigma
+  )
+
+```
+Once done with the processing, we can visualize the resulting clustering on the test set by focusing on the two features we started with in this exercise:
+
+```{r}
+
+# non-ggplot implementation without ellipses
+# plot(Xhd_test[,c(1,3)], col=test_resultsEMhd$clustering+1, pch=19)
+# points(resultsEMhd_train$means[,c(1,3)], col=1, pch=10)
+
+plotData(Xhd_test[,c(1,3)], test_resultsEMhd$clustering, 
+         resultsEMhd_train$means[,c(1,3)], 
+         t="EM, test set, (without K-Means init.)")
+
+```
+
+<u>Class Error:</u>
+
+```{r}
+
+classError(test_resultsEMhd$clustering, y_test)
+
+```
+
+
+<u>Adjusted Rand Index:</u>
+
+```{r}
+
+adjustedRandIndex(test_resultsEMhd$clustering, y_test)
+
+```
+
+<u>Comments and observations:</u>
+
+Going through multiple trials of the EM algorithm, we find that the clustering is less consistent when we use more dimension of the data. Sometimes, two clusters out of three (the best number of clusters found via AIC, BIC, and CV) will gobble the third, making the clustering on the test set rather unreliable.
+
+This is reflected in the higher error rate and lower adjusted rand index found in this section for the EM algorithm compared to the previous one.
+
+#### 5.2.1. Randomly selected features
+
+To test a number of different higher-dimension sets of features, we generate five 5-elements permutations allowed by the dataset (out of 27 feature columns). From this set of 5-permutations, we build the corresponding sets of 3-, and 4- sub-permutations.
+
+As such, the selection of permutations would look something like:
+
+- (a,b,c,d,e), (a,b,c,d), (a,b,c,e), (a,c,d,e), ..., (b,c,d), (c,d,e)
+
+i.e. 5 5-permutations, 600 4-permutations, 14400 3-permutations.
+
+Given this high number of permutations, we only randomly select 20 permutations out of the 4- and 3- permutations sets respectively. 
+
+
+```{r}
+
+# We extract the features from the original dataset
+wine_features = subset(wine, select=-c(Type))
+
+# We produce 5 5-permutations by random sampling
+five_perms = c()
+for (p in 1:5) {
+  five_perms = rbind(five_perms, sample(colnames(wine_features), 5))
+}
+
+# We produce the set of 4-permutations
+four_perms = NULL
+for (p in 1:nrow(five_perms)) {
+  all <- expand.grid(p1 = five_perms[p,], 
+                     p2 = five_perms[p,], 
+                     p3 = five_perms[p,], 
+                     p4 = five_perms[p,],
+                     stringsAsFactors = FALSE)
+  perms <- all[apply(all, 1, function(x) {length(unique(x)) == 4}),]
+  if (is.null(four_perms)) {
+    four_perms = perms
+  } else {
+    four_perms = rbind(four_perms, perms)
+  }
+}
+four_perms = as.matrix(four_perms)
+
+# We produce the set of 3-permutations
+three_perms = NULL
+for (p in 1:nrow(four_perms)) {
+  all <- expand.grid(p1 = four_perms[p,], 
+                     p2 = four_perms[p,], 
+                     p3 = four_perms[p,], 
+                     stringsAsFactors = FALSE)
+  perms <- all[apply(all, 1, function(x) {length(unique(x)) == 3}),]
+  if (is.null(three_perms)) {
+    three_perms = perms
+  } else {
+    three_perms = rbind(three_perms, perms)
+  }
+}
+three_perms = as.matrix(three_perms)
+
+```
+
+We remove the duplicated permutations:
+
+```{r}
+
+five_perms = five_perms[!duplicated(apply(five_perms, 1, sort)),]
+four_perms = four_perms[!duplicated(apply(four_perms, 1, sort)),]
+three_perms = three_perms[!duplicated(apply(three_perms, 1, sort)),]
+
+```
+
+#### 5.2.2. Computing the AIC and BIC for the 5-permutations
+
+We compute the best number of clusters via the use of the AIC and BIC with the following features of the wine dataset.
+
+of the wine dataset.
+
+```{r}
+
+for (perm in 1:nrow(five_perms)) {
+  cat("\nSelected features: ", paste(five_perms[perm,], collapse=", "), "\n")
+  computeAIC(as.matrix(wine_features[five_perms[perm,]]), print_steps=FALSE)
+}
+
+```
+
+```{r}
+
+for (perm in 1:nrow(five_perms)) {
+  cat("\nSelected features: ", paste(five_perms[perm,], collapse=", "), "\n")
+  computeBIC(as.matrix(wine_features[five_perms[perm,]]), print_steps=FALSE)
+}
+
+```
+
+#### 5.2.3. Computing the BIC for the 4-permutations
+
+```{r}
+
+for (perm in sample(1:nrow(four_perms), 20)) {
+  cat("\nSelected features: ", paste(four_perms[perm,], collapse=", "), "\n")
+  computeBIC(as.matrix(wine_features[four_perms[perm,]]), print_steps=FALSE)
+}
+
+```
+
+#### 5.2.4. Computing the BIC for the 3-permutations
+
+```{r}
+
+for (perm in sample(1:nrow(three_perms), 20)) {
+  cat("\nSelected features: ", paste(three_perms[perm,], collapse=", "), "\n")
+  computeBIC(as.matrix(wine_features[three_perms[perm,]]), print_steps=FALSE)
+}
+
+```
