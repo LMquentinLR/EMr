@@ -1,8 +1,5 @@
 ---
 title: "From Scratch Implementation of the Expectation-Maximization Algorithm for Multivariate Gaussian Mixture Models"
-author: |
-  | Elias Boughosn
-  | Quentin Le Roux
 output:
   html_document:
     df_print: paged

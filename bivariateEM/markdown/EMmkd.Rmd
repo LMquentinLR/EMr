@@ -1,0 +1,195 @@
+---
+title: "From Scratch Implementation of the Expectation-Maximization Algorithm for a Bivariate Gaussian Mixture Model with robustness to missing values"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+We consider $X\sim \mathcal{N}(\mu,\Sigma)$, with
+    $$\mu=\begin{pmatrix} 5 \\ -1
+    \end{pmatrix} \textrm{ and } \Sigma=\begin{pmatrix} 1 & 0.5 \\ 0.5 & 1
+    \end{pmatrix}.$$ 
+    
+We want to introduce $r=30\%$ of missing values in the variable $X_2$. We consider that the missing-data mechanism is MCAR.
+
+**Note**: We only introduce NA in either the first or second features as data missing from both would lead to the datapoint being removed in general (industry standard).
+
+## 1 - Preliminary steps: library and dataset imports
+
+#### 1.1. Library imports
+
+```{r  echo=TRUE, results='hide', message=FALSE}
+
+library(mvtnorm); library(pgmm); library(mvtnorm); library(mclust); library(ggplot2)
+
+```
+
+## 2 - Function declaration
+
+#### Expectation step
+
+Have the dataset sorted (twice) such that, for $s1$ and $s_{1,1}$ and then for $s2$ and $s_{2,2}$, the $m$ elements with missing data out of $n$ elements are shuffled at the top of the array dataset such that:
+
+\begin{align}
+s_1 &= \sum^n_{i=m+1}x_{i,1} + \sum^m_{i=1}\big(\mu_1+\frac{\sigma_{1,2}}{\sigma_{2,2}}(x_{i,2} - \mu_2)\big)\\
+s_{1,1} &= \sum^n_{i=m+1}x_{i,1}^2 + \sum^m_{i=1}\big(\big(\mu_1+\frac{\sigma_{1,2}}{\sigma_{2,2}}(x_{i,2} - \mu_2)\big)^2 + \sigma_{1,1} - \frac{\sigma_{1,2}^2}{\sigma_{2,2}}\big)\\
+s_2 &= \sum^n_{i=m+1}x_{i,2} + \sum^m_{i=1}\big(\mu_2+\frac{\sigma_{2,1}}{\sigma_{1,1}}(x_{i,1} - \mu_1)\big)\\
+s_{2,2} &= \sum^n_{i=m+1}x_{i,2}^2 + \sum^m_{i=1}\big(\big(\mu_2+\frac{\sigma_{2,1}}{\sigma_{1,1}}(x_{i,1} - \mu_1)\big)^2 + \sigma_{2,2} - \frac{\sigma_{2,1}^2}{\sigma_{1,1}}\big)\\
+s_{1,2} &= \sum^n_{i=m+1}x_{i,1}.x_{i,2}+\sum^m_{i=1}x_{i,1}\big(\mu_2+\frac{\sigma_{2,1}}{\sigma_{1,1}}(X_{i,1}-\mu_1)\big)\\
+\end{align}
+
+#### Expectation step
+
+We update the parameters such that:
+
+\begin{align}
+\mu_1&=\frac{s_1}{n}\\
+\mu_2&=\frac{s_2}{n}\\
+\sigma_{1,1}&=\frac{s_{1,1}}{n}-(\mu_1)^2\\
+\sigma_{2,2}&=\frac{s_{2,2}}{n}-(\mu_2)^2\\
+\sigma_{1,2}&=\frac{s_{1,2}}{n}-(\mu_1.\mu_2)\\
+\end{align}
+
+```{r}
+
+expectationStep <- function(X, mu, Sigma) {
+  ######
+  #### Expectation step of a bivariate dataset with missing data
+  ######
+    
+  n=nrow(X)
+  missing_idx.x1 = which(is.na(X[,1]))
+  missing_idx.x2 = which(is.na(X[,2]))
+  
+  #all the element in X1 are observed
+  s1_vec = rep(0,n)
+  s11_vec = rep(0,n)
+  s2_vec = rep(0,n)
+  s22_vec = rep(0,n)
+  
+  # For observed elements in X1
+  s1_vec[setdiff(1:n, missing_idx.x1)] = X[setdiff(1:n, missing_idx.x1), 1]
+  s11_vec[setdiff(1:n, missing_idx.x1)] = X[setdiff(1:n, missing_idx.x1), 1]^2
+  
+  # For observed elements in X2
+  s2_vec[setdiff(1:n, missing_idx.x2)] = X[setdiff(1:n, missing_idx.x2), 2]
+  s22_vec[setdiff(1:n, missing_idx.x2)] = X[setdiff(1:n, missing_idx.x2), 2]^2
+  
+  # For missing elements in X1
+  s1_vec[missing_idx.x1] = mu[1] + (Sigma[1,2]/Sigma[2,2]) * (X[missing_idx.x1,2]-mu[2])
+  s11_vec[missing_idx.x1] = s1_vec[missing_idx.x1]^2 + Sigma[1,1] - Sigma[2,1]^2 / Sigma[2,2]
+  
+  # For missing elements in X2
+  s2_vec[missing_idx.x2] = mu[2] + (Sigma[2,1]/Sigma[1,1]) * (X[missing_idx.x2,1]-mu[1])
+  s22_vec[missing_idx.x2] = s2_vec[missing_idx.x2]^2 + Sigma[2,2] - Sigma[1,2]^2 / Sigma[1,1]
+  
+  s12_vec = s1_vec * s2_vec
+  
+  return(list(
+    n=n,
+    s1=sum(s1_vec), 
+    s2=sum(s2_vec), 
+    s11=sum(s11_vec), 
+    s22=sum(s22_vec), 
+    s12 = sum(s12_vec)
+    )
+  )
+}
+
+maximizationStep <- function(n, s1, s2, s11, s22, s12) {
+  ######
+  #### Maximization step of a bivariate dataset with missing data
+  ######
+  mu1 = s1/n
+  mu2 = s2/n
+  sigma11 = s11/n-(mu1)^2
+  sigma22 = s22/n-(mu2)^2
+  sigma12 = s12/n-(mu1*mu2)
+  return(list(
+    mu = matrix(c(mu1, mu2), nrow=1, ncol=2),
+    sigma = matrix(c(sigma11, sigma12, sigma12, sigma22), nrow=2, ncol=2)
+  ))
+} 
+
+emAlgotithm <- function(X, initMu, initSigma, maxIteration=50) {
+  ######
+  #### Runs the EM algorithm for a given number of iterations
+  ######
+  
+  # Copies the initialized values for mu and sigma
+  copyMu = initMu
+  copySigma = initSigma
+  
+  for (loop in 1:maxIteration) {
+    e = expectationStep(X, copyMu, copySigma)
+    m = maximizationStep(e$n, e$s1, e$s2, e$s11, e$s22, e$s12)
+    copyMu = m$mu
+    copySigma = m$sigma
+  }
+  
+  return(list(mu=copyMu, sigma=copySigma))
+
+}
+
+```
+
+## 3 - Sample generation
+
+We generate a bivariate normal set of sample size $n=100$, with mean $\mu$ and covariance matrix $\Sigma$ (use the package mvtnorm).
+
+#### 3.1. Distribution parameters
+
+```{r}
+
+mu = matrix(c(5, -1), nrow=1, ncol=2)
+sigma = matrix(c(1, 0.5, 0.5, 1), nrow=2, ncol=2)
+
+mu
+sigma
+
+```
+
+#### 3.2. Data generation
+
+```{r}
+
+n = 100
+X = rmvnorm(n, mu, sigma)
+
+```
+
+## 4 - Introduction of "missing completely at random variables"
+
+The goal is now to estimate the parameters $\mu$ and $\Sigma$ in presence of missing values in $X1$ and $X_2$ by using the EM algorithm.
+
+```{r}
+
+ratio = 0.3
+
+missing_idx.mcar <- sample.int(n, ratio*n)
+missing_idx.x1 <- sample(missing_idx.mcar, (ratio/2)*n)
+missing_idx.x2 <- setdiff(missing_idx.mcar, missing_idx.x1)
+
+X[missing_idx.x1, 1] = NA
+X[missing_idx.x2, 2] = NA
+
+```
+
+## 5 - Initialization of the EM algorithm
+
+```{r}
+
+# We use the empirical mean and sigma
+mu_init = apply(X, 2, mean, na.rm=TRUE)
+sigma_init = cov(X, use="complete.obs")
+
+```
+
+## 6 - Running the EM algorithm
+
+```{r}
+
+emAlgotithm(X, mu, sigma)
+
+```
